@@ -82,7 +82,17 @@ export class CheckoutService {
     const cart = await this.validateCart(cartId);
     console.log(`Cart validated: ${cart.items.length} items, total: $${cart.total}`);
 
-    // Create the order
+        // Process payment first, before starting database transaction
+    const paymentResult = await this.paymentGateway.processPayment(
+      { ...cart, id: `ORD-${Date.now()}` },
+      paymentDetails
+    );
+
+    if (!paymentResult.success) {
+      throw new PaymentProcessingError(paymentResult.error);
+    }
+
+    // Create the order after successful payment
     const order: Order = {
       id: `ORD-${Date.now()}`,
       cartId: cart.id,
@@ -90,12 +100,23 @@ export class CheckoutService {
       items: cart.items,
       total: cart.total,
       currency: 'USD',
-      status: 'pending',
+      status: 'confirmed',
+      paymentId: paymentResult.transactionId,
       createdAt: new Date().toISOString(),
     };
 
-    // Start database transaction
+    // Start database transaction only for order persistence
     const transaction = await this.db.beginTransaction();
+    
+    try {
+      await this.db.orders.insert(order, { transaction });
+      await this.db.transaction.commit();
+    } catch (error) {
+      await this.db.transaction.rollback();
+      // Implement compensation: refund the payment
+      await this.paymentGateway.refundPayment(paymentResult.transactionId);
+      throw error;
+    }
 
     try {
       // Insert the order
